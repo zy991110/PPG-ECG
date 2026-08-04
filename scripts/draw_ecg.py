@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-绘制标准 ECG 波形图（P-QRS-T-U 全标注 + 间期）—— 优化版
-关键改进：
-  1. 各分量峰值用数值方法在合成波形上精确求取，标注圆点钉在真实峰值上
-  2. 文字标签偏移按分量类型动态计算（P/R/T 朝上、Q/S 朝下、避开邻波）
-  3. 标签与圆点用细引导线连接，消除"标签飘在别处"的错位感
-依赖：numpy, Pillow
+绘制标准 ECG 波形图（P-QRS-T-U 全标注 + 间期）—— v3
+关键改进（v3）：
+  1. Q/S 标签对称放置：Q 朝左下、S 朝右下，避免在 R 两侧重叠
+  2. 间期括号端点 x 严格 = 标注圆点 x（对齐），括号分层排列在等电位线下方
+  3. 间期标签文字居中对齐括号中点
+依赖：Pillow
 """
 import os
-import numpy as np
+import math
 from PIL import Image, ImageDraw, ImageFont
 
 FONT_PATH = os.environ.get("FONT_PATH")
@@ -21,8 +21,7 @@ if not FONT_PATH:
 
 OUTPUT = os.path.join(os.path.dirname(__file__), "..", "images", "ecg_waveform.png")
 
-# ---------- 波形参数 ----------
-W, H = 1500, 660
+W, H = 1500, 700
 BG = (255, 255, 255)
 LINE = (23, 28, 45)
 GRID = (230, 235, 245); GRID_MAJOR = (200, 210, 228)
@@ -33,139 +32,143 @@ GRAY = (110, 115, 125)
 img = Image.new("RGB", (W, H), BG)
 d = ImageDraw.Draw(img)
 def f(sz): return ImageFont.truetype(FONT_PATH, sz)
-f_title = f(26); f_lbl = f(22); f_small = f(17); f_micro = f(15)
+f_title = f(26); f_lbl = f(22); f_small = f(17)
 
-ML, MR, MT, MB = 75, 75, 75, 85
+ML, MR, MT, MB = 75, 75, 75, 95
 PW, PH = W - ML - MR, H - MT - MB
 
 total_ms = 2400
 xscale = PW / total_ms
-ybase = MT + PH * 0.55            # 等电位线
-mV_scale = 115                    # 1mV = 115px
+ybase = MT + PH * 0.50          # 等电位线居中，给上下都留空间
+mV_scale = 120
 
-# ---------- 网格（小格40ms / 大格200ms；纵向 0.25mV/0.5mV） ----------
+# 网格
 t = 0
 while t <= total_ms:
-    x = ML + t * xscale
-    d.line([(x, MT), (x, MT + PH)], fill=GRID, width=1); t += 40
+    x = ML + t * xscale; d.line([(x, MT), (x, MT + PH)], fill=GRID, width=1); t += 40
 t = 0
 while t <= total_ms:
-    x = ML + t * xscale
-    d.line([(x, MT), (x, MT + PH)], fill=GRID_MAJOR, width=1); t += 200
+    x = ML + t * xscale; d.line([(x, MT), (x, MT + PH)], fill=GRID_MAJOR, width=1); t += 200
 v = -2.0
 while v <= 2.0:
-    y = ybase - v * mV_scale
-    d.line([(ML, y), (ML + PW, y)], fill=GRID, width=1); v += 0.25
+    y = ybase - v * mV_scale; d.line([(ML, y), (ML + PW, y)], fill=GRID, width=1); v += 0.25
 v = -2.0
 while v <= 2.0:
-    y = ybase - v * mV_scale
-    d.line([(ML, y), (ML + PW, y)], fill=GRID_MAJOR, width=1); v += 0.5
+    y = ybase - v * mV_scale; d.line([(ML, y), (ML + PW, y)], fill=GRID_MAJOR, width=1); v += 0.5
 
-# ---------- 合成 ECG 波形（高密度采样，3 个周期） ----------
 def ecg_cycle(t_rel):
+    """纯Python实现的高斯分量叠加ECG波形（替代numpy）"""
+    def gauss(t, mu, sigma, amp):
+        return amp * math.exp(-((t - mu) ** 2) / (2 * sigma ** 2))
     v = 0.0
-    v += 0.15 * np.exp(-((t_rel - 90)  ** 2) / (2 * 28 ** 2))   # P
-    v += -0.10 * np.exp(-((t_rel - 208) ** 2) / (2 * 6  ** 2))  # Q
-    v += 1.20 * np.exp(-((t_rel - 222) ** 2) / (2 * 8  ** 2))   # R
-    v += -0.30 * np.exp(-((t_rel - 236) ** 2) / (2 * 8  ** 2))  # S
-    v += 0.35 * np.exp(-((t_rel - 380) ** 2) / (2 * 45 ** 2))   # T
-    v += 0.08 * np.exp(-((t_rel - 500) ** 2) / (2 * 30 ** 2))   # U
+    v += gauss(t_rel, 90,  28, 0.15)    # P
+    v += gauss(t_rel, 208, 6,  -0.10)   # Q
+    v += gauss(t_rel, 222, 8,  1.20)     # R
+    v += gauss(t_rel, 236, 8,  -0.30)   # S
+    v += gauss(t_rel, 380, 45, 0.35)    # T
+    v += gauss(t_rel, 500, 30, 0.08)    # U
     return v
 
 cycle_len = 800
-xs = np.linspace(0, total_ms, 4000)
-ys = np.array([ecg_cycle(t % cycle_len) for t in xs])
+# 纯Python生成采样点
+xs = [i * (total_ms / 3999) for i in range(4000)]
+ys = [ecg_cycle(t % cycle_len) for t in xs]
 pts = [(ML + x * xscale, ybase - y * mV_scale) for x, y in zip(xs, ys)]
 d.line(pts, fill=LINE, width=2)
 
-# ---------- 坐标换算 ----------
 def tx(ms): return ML + ms * xscale
 def ty(mv): return ybase - mv * mV_scale
 
-# ---------- 数值求每个分量的真实峰值（在合成波形上） ----------
-# 仅在第1个周期内搜索
 def find_peak(t_center, window=18, direction="max"):
-    """在 [t_center-window, t_center+window] 范围内数值求真实峰"""
-    grid = np.linspace(t_center - window, t_center + window, 2001)
-    vals = np.array([ecg_cycle(t) for t in grid])
+    """纯Python数值求峰：在窗口内扫描最大/最小值"""
+    grid = [t_center - window + i * (2 * window / 2000) for i in range(2001)]
+    vals = [ecg_cycle(t) for t in grid]
     if direction == "max":
-        i = int(np.argmax(vals))
+        i = vals.index(max(vals))
     else:
-        i = int(np.argmin(vals))
-    return float(grid[i]), float(vals[i])
+        i = vals.index(min(vals))
+    return grid[i], vals[i]
 
 peaks = {
-    "P": (*find_peak(90,  window=25, direction="max"), RED,    "up"),
-    "Q": (*find_peak(208, window=14, direction="min"), ORANGE, "down"),
-    "R": (*find_peak(222, window=12, direction="max"), BLUE,   "up"),
-    "S": (*find_peak(236, window=14, direction="min"), PURPLE, "down"),
-    "T": (*find_peak(380, window=40, direction="max"), GREEN,  "up"),
-    "U": (*find_peak(500, window=35, direction="max"), BROWN,  "up"),
+    "P": (*find_peak(90,  window=25, direction="max"), RED,    "up",    "right"),
+    "Q": (*find_peak(208, window=14, direction="min"), ORANGE, "down",  "left"),   # Q朝左下
+    "R": (*find_peak(222, window=12, direction="max"), BLUE,   "up",    "right"),
+    "S": (*find_peak(236, window=14, direction="min"), PURPLE, "down",  "right"),  # S朝右下
+    "T": (*find_peak(380, window=40, direction="max"), GREEN,  "up",    "right"),
+    "U": (*find_peak(500, window=35, direction="max"), BROWN,  "up",    "right"),
 }
 
-# ---------- 标注点 + 动态标签 ----------
-# 标签距峰值像素 + 引导线
-LABEL_DX = 14          # 水平偏移
-LABEL_DY = 38          # 垂直偏移
-
-def draw_label(name, t_pk, v_pk, color, orient):
+# ---------- 标注圆点 + 动态标签 ----------
+DX = 16; DY = 40
+def draw_label(name, t_pk, v_pk, color, orient, hside):
     px, py = tx(t_pk), ty(v_pk)
-    # 圆点钉在真实峰值
     d.ellipse([px-6, py-6, px+6, py+6], fill=color, outline=(255,255,255), width=2)
-    # 标签位置：正向波朝上偏移、负向波朝下偏移
     if orient == "up":
-        lx, ly = px + LABEL_DX, py - LABEL_DY
+        ly = py - DY
     else:
-        lx, ly = px + LABEL_DX, py + LABEL_DY
-    # 引导线（圆点边缘 → 标签）
+        ly = py + DY
+    if hside == "left":
+        lx = px - DX
+        # 标签锚在圆点左侧，文字右对齐到引导线起点
+        tw = d.textlength(name, font=f_lbl)
+        lx_text = lx - tw
+    else:
+        lx = px + DX
+        lx_text = lx
     d.line([(px, py), (lx, ly)], fill=color, width=2)
-    # 文字背景小框，避免压在波线上
-    d.text((lx, ly - f_lbl.size), name, fill=color, font=f_lbl)
+    d.text((lx_text, ly - f_lbl.size), name, fill=color, font=f_lbl)
+    return px  # 返回圆点x，供间期对齐用
 
-for name, (t_pk, v_pk, color, orient) in peaks.items():
-    draw_label(name, t_pk, v_pk, color, orient)
+peak_px = {}
+for name, (t_pk, v_pk, color, orient, hside) in peaks.items():
+    peak_px[name] = draw_label(name, t_pk, v_pk, color, orient, hside)
 
-# ---------- 关键文字描述（在标签旁边补中文全称，放图例区） ----------
-# 在右上角放图例
+# ---------- 图例 ----------
 legend_x, legend_y = W - 320, MT + 6
 d.text((legend_x, legend_y), "波形分量", fill=LINE, font=f_lbl)
-legend_items = [
-    ("P", "心房去极化",   RED),
-    ("QRS","心室去极化",  BLUE),
-    ("T", "心室复极化",   GREEN),
-    ("U", "复极化延迟",   BROWN),
-]
+legend_items = [("P","心房去极化",RED),("QRS","心室去极化",BLUE),("T","心室复极化",GREEN),("U","复极化延迟",BROWN)]
 lyy = legend_y + 30
 for code, desc, col in legend_items:
     d.ellipse([legend_x-2, lyy-2, legend_x+10, lyy+10], fill=col)
     d.text((legend_x+16, lyy-2), f"{code}  {desc}", fill=LINE, font=f_small)
     lyy += 22
 
-# ---------- 间期标注（括号 + 标签） ----------
+# ---------- 间期括号（端点严格对齐圆点 x） ----------
+# 分层 y，避免重叠；标签居中
 def bracket(x1, x2, y, label, color):
+    # 保证 x1 < x2
+    if x1 > x2: x1, x2 = x2, x1
     d.line([(x1, y), (x2, y)], fill=color, width=2)
-    d.line([(x1, y-6), (x1, y+6)], fill=color, width=2)
-    d.line([(x2, y-6), (x2, y+6)], fill=color, width=2)
-    mid = (x1+x2)/2
+    d.line([(x1, y-7), (x1, y+7)], fill=color, width=2)
+    d.line([(x2, y-7), (x2, y+7)], fill=color, width=2)
     tw = d.textlength(label, font=f_small)
-    d.text((mid - tw/2, y+8), label, fill=color, font=f_small)
+    d.text(((x1+x2)/2 - tw/2, y + 9), label, fill=color, font=f_small)
 
-# 用真实峰值点定义间期起止
-p_t  = peaks["P"][0]
-q_t  = peaks["Q"][0]
-s_t  = peaks["S"][0]
-t_t  = peaks["T"][0]
-# PR 间期: P起点(~P-50ms) → QRS起点(Q)
-bracket(tx(p_t-50), tx(q_t), ty(-0.85), "PR间期 120-200ms", GRAY)
-# QRS 时限: Q → S
-bracket(tx(q_t), tx(s_t), ty(-0.55), "QRS 60-100ms", GRAY)
-# ST 段: S → T起点(~T-60ms)
-bracket(tx(s_t), tx(t_t-60), ty(-0.38), "ST段", GRAY)
-# QT 间期: QRS起点(Q) → T终点(~T+80ms)
-bracket(tx(q_t), tx(t_t+80), ty(-1.18), "QT间期 (男<440 / 女<460 ms)", GRAY)
+# 间期端点 x 严格 = 对应圆点 x
+p_x = peak_px["P"]; q_x = peak_px["Q"]; s_x = peak_px["S"]; t_x = peak_px["T"]
+# PR间期: P起点(取P峰左侧50ms) → Q峰
+pr_x1 = tx(peaks["P"][0] - 50)
+pr_x2 = q_x
+# QRS时限: Q峰 → S峰
+qrs_x1 = q_x; qrs_x2 = s_x
+# ST段: S峰 → T峰左侧60ms
+st_x1 = s_x; st_x2 = tx(peaks["T"][0] - 60)
+# QT间期: Q峰 → T峰右侧80ms
+qt_x1 = q_x; qt_x2 = tx(peaks["T"][0] + 80)
 
-# 等电位线
-d.text((ML + 6, ybase - 12), "等电位线 (基线)", fill=GRAY, font=f_small)
+# 分层 y（从浅到深，避开波形下方）：ST 最浅，QRS 中，PR/QT 最深
+y_st  = ybase + 70
+y_qrs = ybase + 110
+y_pr  = ybase + 150
+y_qt  = ybase + 190
+
+bracket(pr_x1,  pr_x2,  y_pr,  "PR间期 120-200ms", GRAY)
+bracket(qrs_x1, qrs_x2, y_qrs, "QRS 60-100ms",      GRAY)
+bracket(st_x1,  st_x2,  y_st,  "ST段",              GRAY)
+bracket(qt_x1,  qt_x2,  y_qt,  "QT间期 (男<440 / 女<460 ms)", GRAY)
+
+# 等电位线标注
+d.text((ML + 6, ybase - 22), "等电位线 (基线)", fill=GRAY, font=f_small)
 
 # 标题与坐标轴
 d.text((ML, 24), "标准 ECG 波形：P-QRS-T-U 综合波（3 个心动周期）", fill=LINE, font=f_title)
@@ -175,7 +178,11 @@ os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 img.save(OUTPUT)
 print(f"ECG waveform saved -> {OUTPUT}")
 
-# 打印真实峰值，便于核对
-print("标注峰值（数值求取）:")
-for name,(t_pk,v_pk,_,_) in peaks.items():
-    print(f"  {name}: t={t_pk:.1f}ms  v={v_pk:.3f}mV  px=({tx(t_pk):.0f},{ty(v_pk):.0f})")
+print("标注峰值与圆点x坐标:")
+for name,(t_pk,v_pk,_,_,_) in peaks.items():
+    print(f"  {name}: t={t_pk:.1f}ms v={v_pk:.3f}mV px_x={peak_px[name]:.0f}")
+print("间期端点:")
+print(f"  PR : {pr_x1:.0f} -> {pr_x2:.0f}  (P-50ms -> Q峰)")
+print(f"  QRS: {qrs_x1:.0f} -> {qrs_x2:.0f}  (Q峰 -> S峰)")
+print(f"  ST : {st_x1:.0f} -> {st_x2:.0f}  (S峰 -> T-60ms)")
+print(f"  QT : {qt_x1:.0f} -> {qt_x2:.0f}  (Q峰 -> T+80ms)")
